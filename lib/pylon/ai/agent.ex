@@ -1,7 +1,7 @@
 defmodule Pylon.AI.Agent do
   @moduledoc """
   Generic AI Agent that takes tools, goals, and args.
-  Implements a synchronous ReAct pattern.
+  Implements a synchronous ReAct pattern with composable steps.
 
   ## Usage
 
@@ -28,11 +28,30 @@ defmodule Pylon.AI.Agent do
         timeout: 30_000
       )
 
+  ### Custom steps:
+
+      {:ok, result} = Pylon.AI.Agent.run(
+        name: "agent-1",
+        goal: "Calculate (5 + 3) * 2",
+        tools: ["calculator"],
+        steps: [
+          Pylon.AI.Steps.BuildSystemPrompt,
+          MyApp.Steps.CustomLogging,
+          Pylon.AI.Steps.CallLLM,
+          Pylon.AI.Steps.ParseResponse,
+          Pylon.AI.Steps.CheckCompletion,
+          Pylon.AI.Steps.HandleToolCall,
+          Pylon.AI.Steps.CheckStepCount,
+          Pylon.AI.Steps.IncrementStep
+        ]
+      )
+
   """
   use GenServer, restart: :temporary
-  alias Pylon.AI.Toolset
-  alias Pylon.AI.LLMAdapter
-  alias ReqLLM.Context
+
+  alias Pylon.AI.Agent.Context
+  alias Pylon.AI.Agent.Pipeline
+
   require Logger
 
   defstruct name: nil,
@@ -42,24 +61,38 @@ defmodule Pylon.AI.Agent do
             history: [],
             model: nil,
             step: 0,
+            max_steps: nil,
             from: nil,
             on_complete: nil,
-            caller: nil
+            caller: nil,
+            steps: []
 
   @type t :: %__MODULE__{
           name: String.t(),
           goal: String.t(),
-          input: String.t(),
+          input: String.t() | nil,
           available_tools: list(String.t()),
           history: list(),
           model: String.t(),
           step: non_neg_integer(),
+          max_steps: non_neg_integer() | nil,
           from: GenServer.from() | nil,
           on_complete: {pid(), atom()} | nil,
-          caller: pid() | nil
+          caller: pid() | nil,
+          steps: list(module() | {module(), keyword()})
         }
 
   @default_model "google:gemini-2.5-flash"
+
+  @default_steps [
+    Pylon.AI.Steps.BuildSystemPrompt,
+    Pylon.AI.Steps.CallLLM,
+    Pylon.AI.Steps.ParseResponse,
+    Pylon.AI.Steps.CheckCompletion,
+    Pylon.AI.Steps.HandleToolCall,
+    Pylon.AI.Steps.CheckStepCount,
+    Pylon.AI.Steps.IncrementStep
+  ]
 
   # Public API
 
@@ -75,6 +108,8 @@ defmodule Pylon.AI.Agent do
   * `:input` - Optional. Additional input context for the agent.
   * `:model` - Optional. LLM model to use (defaults to "google:gemini-2.5-flash").
   * `:on_complete` - Required for cast mode. {pid, message} to send result to.
+  * `:max_steps` - Optional. Maximum number of iterations before forcing halt.
+  * `:steps` - Optional. Custom list of step modules to use instead of defaults.
 
   """
   def start(opts) do
@@ -91,7 +126,9 @@ defmodule Pylon.AI.Agent do
         input: opts[:input],
         tools: tools,
         model: opts[:model] || @default_model,
-        on_complete: on_complete
+        on_complete: on_complete,
+        max_steps: opts[:max_steps],
+        steps: opts[:steps] || @default_steps
       }
     }
 
@@ -109,6 +146,8 @@ defmodule Pylon.AI.Agent do
   * `:input` - Optional. Additional input context for the agent.
   * `:model` - Optional. LLM model to use.
   * `:timeout` - Optional. Timeout in milliseconds (default: :infinity).
+  * `:max_steps` - Optional. Maximum number of iterations before forcing halt.
+  * `:steps` - Optional. Custom list of step modules to use instead of defaults.
 
   """
   def run(opts) do
@@ -127,7 +166,9 @@ defmodule Pylon.AI.Agent do
         tools: tools,
         model: opts[:model] || @default_model,
         on_complete: nil,
-        caller: caller
+        caller: caller,
+        max_steps: opts[:max_steps],
+        steps: opts[:steps] || @default_steps
       }
     }
 
@@ -196,9 +237,11 @@ defmodule Pylon.AI.Agent do
       model: opts.model,
       history: [],
       step: 0,
+      max_steps: opts.max_steps,
       from: nil,
       on_complete: opts.on_complete,
-      caller: opts.caller
+      caller: opts.caller,
+      steps: opts.steps
     }
 
     # Start the agent loop immediately
@@ -214,165 +257,69 @@ defmodule Pylon.AI.Agent do
 
   @impl GenServer
   def handle_info(:run, state) do
-    case run_step(state) do
-      {:continue, new_state} ->
-        # Schedule next step
+    # Build context from current state
+    context =
+      Context.new(
+        name: state.name,
+        goal: state.goal,
+        input: state.input,
+        model: state.model,
+        tools: state.available_tools,
+        max_steps: state.max_steps
+      )
+      |> Map.put(:history, state.history)
+      |> Map.put(:step_count, state.step)
+
+    # Run one iteration of the pipeline
+    result_context = Pipeline.run(context, state.steps)
+    
+    Logger.warning("Agent loop: halted=#{result_context.halted}, result=#{inspect(result_context.result)}, step_count=#{result_context.step_count}")
+
+    cond do
+      result_context.halted ->
+        # Pipeline halted (completion, error, or max_steps reached)
+        Logger.warning("Agent completing with result: #{inspect(result_context.result)}")
+        complete_agent(state, result_context.result)
+        {:stop, :normal, state}
+
+      true ->
+        # Continue to next iteration
+        new_state = %{
+          state
+          | history: result_context.history,
+            step: result_context.step_count + 1
+        }
+
         send(self(), :run)
         {:noreply, new_state}
-
-      {:complete, result, final_state} ->
-        complete_agent(final_state, result)
-        {:stop, :normal, final_state}
-
-      {:error, reason, final_state} ->
-        complete_agent(final_state, {:error, reason})
-        {:stop, :error, final_state}
     end
   end
 
   # Private Functions
 
-  defp run_step(state) do
-    messages = build_messages(state)
-
-    case LLMAdapter.generate_text(state.model, messages) do
-      {:ok, resp} ->
-        resp
-        |> ReqLLM.Response.text()
-        |> parse_response()
-        |> handle_response(state)
-
-      {:error, reason} ->
-        {:error, "LLM API call failed: #{inspect(reason)}", state}
-    end
-  end
-
-  defp build_messages(state) do
-    base_prompt =
-      if state.input do
-        """
-        The input to process is given below:
-        #{state.input}
-        """
-      else
-        ""
+  defp complete_agent(state, result) do
+    # Ensure result is in {:ok, _} or {:error, _} format
+    normalized_result =
+      case result do
+        {:ok, _} -> result
+        {:error, _} -> result
+        other -> {:ok, other}
       end
 
-    [
-      Context.system(system_prompt(state.available_tools, state.goal))
-    ] ++ state.history ++ [Context.user(base_prompt)]
-  end
-
-  defp system_prompt(tools, goal) do
-    specs =
-      tools
-      |> Enum.map(&Toolset.get/1)
-      |> Enum.reject(&is_nil/1)
-      |> Enum.map(&Toolset.format_tool/1)
-      |> Enum.join("\n")
-
-    """
-    #{goal}
-
-    You can call one tool at a time.
-    To call a tool you must give a JSON format such as mentioned below.
-    DO NOT explain reasoning just return the structured output.
-
-    ```json
-    {"tool": "tool_name","args": {"tool_arg_a": "data_a","tool_arg_b": "data_b"...}}
-    ```
-
-    When you have completed your task, respond with a completion in JSON format:
-
-    ```json
-    {"completion": {"result": "your final result here", "details": "any additional details"}}
-    ```
-
-    You have access to the following tools:
-    #{specs}
-    """
-  end
-
-  defp parse_response(text) when is_binary(text) do
-    text
-    |> String.trim_trailing("\n```")
-    |> String.split("```json\n")
-    |> case do
-      [_, expected_json] -> expected_json
-      [maybe_json] -> maybe_json
-    end
-    |> JSON.decode()
-  end
-
-  defp handle_response({:ok, %{"completion" => completion}}, state) when is_map(completion) do
-    Logger.info("Agent #{state.name} completed with result: #{inspect(completion)}")
-    {:complete, {:ok, completion}, state}
-  end
-
-  defp handle_response({:ok, %{"tool" => tool_name, "args" => args}}, state)
-       when is_binary(tool_name) and is_map(args) do
-    case execute_tool(tool_name, args, state) do
-      {:ok, result} ->
-        message_content = "Tool '#{tool_name}' returned: #{inspect(result)}"
-        history = state.history ++ [Context.user(message_content)]
-
-        new_state = %{
-          state
-          | history: history,
-            step: state.step + 1
-        }
-
-        {:continue, new_state}
-
-      {:error, reason} ->
-        error_msg = "Tool '#{tool_name}' failed: #{inspect(reason)}"
-        history = state.history ++ [Context.user(error_msg)]
-
-        new_state = %{state | history: history, step: state.step + 1}
-        {:continue, new_state}
-    end
-  end
-
-  defp handle_response({:ok, invalid}, state) do
-    {:error, "Invalid AI response format: #{inspect(invalid)}", state}
-  end
-
-  defp handle_response({:error, reason}, state) do
-    {:error, "Failed to parse AI response: #{inspect(reason)}", state}
-  end
-
-  defp execute_tool(tool_name, args, state) do
-    case Toolset.get(tool_name) do
-      nil ->
-        {:error, "Tool '#{tool_name}' is not registered"}
-
-      tool_module ->
-        Logger.info(
-          "Agent #{state.name} executing tool '#{tool_name}' with args: #{inspect(args)}"
-        )
-
-        try do
-          tool_module.run(args)
-        rescue
-          e ->
-            Logger.error("Tool '#{tool_name}' raised exception: #{inspect(e)}")
-            {:error, "Tool execution failed: #{inspect(e)}"}
-        end
-    end
-  end
-
-  defp complete_agent(state, result) do
     # Notify callback if provided
     if state.on_complete do
       {pid, message} = state.on_complete
-      send(pid, {message, state.name, result})
+      send(pid, {message, state.name, normalized_result})
     end
 
     # Send result to the caller process (for run/1 blocking mode)
     if state.caller do
-      send(state.caller, {:agent_result, state.name, result})
+      send(state.caller, {:agent_result, state.name, normalized_result})
     end
 
-    Logger.info("Agent #{state.name} completed")
+    case normalized_result do
+      {:ok, _} -> Logger.info("Agent #{state.name} completed successfully")
+      {:error, reason} -> Logger.error("Agent #{state.name} failed: #{inspect(reason)}")
+    end
   end
 end
