@@ -25,17 +25,17 @@ The core of Pylon is the AI Agent system, which implements a ReAct pattern:
 ┌─────────────────────────────────────────────────────────────┐
 │                       Pylon.AI.Agent                        │
 ├─────────────────────────────────────────────────────────────┤
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │  Pipeline Steps (Composable & Customizable)         │   │
-│  │                                                     │   │
-│  │  1. BuildSystemPrompt  → Format system message      │   │
-│  │  2. CallLLM           → Send request to LLM         │   │
-│  │  3. ParseResponse     → Parse LLM response          │   │
-│  │  4. CheckCompletion   → Check if goal achieved      │   │
-│  │  5. HandleToolCall    → Execute tool if requested   │   │
-│  │  6. CheckStepCount    → Check max steps limit       │   │
-│  │  7. IncrementStep     → Advance iteration counter   │   │
-│  └─────────────────────────────────────────────────────┘   │
+│  ┌─────────────────────────────────────────────────────┐    │
+│  │  Pipeline Steps (Composable & Customizable)         │    │
+│  │                                                     │    │
+│  │  1. BuildSystemPrompt  → Format system message      │    │
+│  │  2. CallLLM           → Send request to LLM         │    │
+│  │  3. ParseResponse     → Parse LLM response          │    │
+│  │  4. CheckCompletion   → Check if goal achieved      │    │
+│  │  5. HandleToolCall    → Execute tool if requested   │    │
+│  │  6. CheckStepCount    → Check max steps limit       │    │
+│  │  7. IncrementStep     → Advance iteration counter   │    │
+│  └─────────────────────────────────────────────────────┘    │
 └─────────────────────────────────────────────────────────────┘
                               ↓
                     ┌──────────────────┐
@@ -306,6 +306,3 @@ lib/
 - **Elixir Forum**: https://elixirforum.com/c/phoenix-forum
 - **ReAct Pattern**: Reasoning + Acting pattern for LLM agents
 
-## License
-
-This project is licensed under the MIT License.
